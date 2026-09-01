@@ -1,70 +1,78 @@
 name: "Tests"
 on:
-  pull_request:
-  push:
-    branches:
-      - master
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: >-
+          Optional jasmine spec-name filter. Matched as a case-sensitive
+          substring of a spec's full name (top-level describe + section + spec),
+          e.g. 'ink' selects the Links / reflink / nolink specs. Empty runs the
+          full suite. Jasmine reads bare positional arguments as spec FILE globs,
+          so the value has to reach it as --filter=<value> to narrow anything.
+        required: false
+        default: ""
 
 jobs:
   Test:
     if: "!contains(github.event.head_commit.message, '[skip ci]')"
     strategy:
+      fail-fast: false
       matrix:
-        node_version: ['lts/*', 'node']
+        # Upstream's floating 'lts/*' and 'node' aliases resolved to Node 14 and
+        # Node 16 at the 2.0.6 release (2021-05-27); pinned so the legs are
+        # reproducible. Node 8 (the package.json engines floor) cannot run this
+        # suite at all: the pinned jasmine 3.7 test runner's own lib/loader.js
+        # uses dynamic import(), which Node 8's parser rejects before any spec
+        # loads. Upstream never tested Node 8 in CI either.
+        node_version: [14, 16]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
       - name: Install Node
-        uses: dcodeIO/setup-node-nvm@master
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node_version }}
       - name: Install Dependencies
         run: npm ci
       - name: Run Unit Tests 👩🏽‍💻
-        run: npm run test:unit
-      - name: Run Spec Tests 👩🏽‍💻
-        run: npm run test:specs
-
-  Lint:
-    if: "!contains(github.event.head_commit.message, '[skip ci]')"
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v2
-      - name: Install Dependencies
-        run: npm ci
-      - name: Lint ✨
-        run: npm run test:lint
-
-  Release:
-    needs: [Test, Lint]
-    if: |
-      github.ref == 'refs/heads/master' &&
-      github.event.repository.fork == false
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v2
-      - name: Install Dependencies
-        run: npm ci
-      - name: Build 🗜️
-        run: |
-          npm run build
-          if ! git diff --quiet; then
-            git config --global user.email "<>"
-            git config --global user.name "MarkedJS bot"
-            git commit -am "🗜️ build [skip ci]"
-          fi
-      - name: Release 🎉
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npx semantic-release
-
-  Skip:
-    if: contains(github.event.head_commit.message, '[skip ci]')
-    runs-on: ubuntu-latest
-    steps:
-      - name: Skip CI 🚫
-        run: echo skip ci
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          if [ -n "$TEST_FILTER" ]; then
+            npm run test:unit -- "--filter=$TEST_FILTER"
+          else
+            npm run test:unit
+          fi
+      - name: Run Spec Tests 👩🏽‍💻
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          if [ -n "$TEST_FILTER" ]; then
+            npm run test:specs -- "--filter=$TEST_FILTER"
+          else
+            npm run test:specs
+          fi
+      # The public tarball's member set was produced by npm 7.12.0; npm majors
+      # differ in pack's always-include rules, so pin the packing npm here only
+      # (after install, so npm ci above stays on the matrix runtime's own npm).
+      - name: Pin npm to the version that packed the release
+        if: matrix.node_version == 14
+        run: npm i -g npm@7.12.0
+      # Pack the tree as-is. Do NOT run npm run build / rollup / minify:
+      # rollup.config.js and rollup.config.esm.js interpolate
+      # new Date().getFullYear() into the copyright banner, so a rebuild today
+      # emits a 2026 banner where the published lib/marked.js, lib/marked.esm.js
+      # and marked.min.js carry 2021. Those files are committed at the release
+      # commit and ARE the published bytes.
+      - name: Pack Release Tarball
+        if: matrix.node_version == 14
+        run: npm pack
+      - name: Upload Release Tarball
+        if: matrix.node_version == 14
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-tarball
+          path: marked-*.tgz
+          if-no-files-found: error
